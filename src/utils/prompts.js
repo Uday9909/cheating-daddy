@@ -201,6 +201,15 @@ Provide direct exam answers in **markdown format**. Include the question text, t
     },
 };
 
+// Applies to every profile: the user pastes this text directly into another app.
+const PASTE_READY_RULE = `**PASTE-READY OUTPUT (non-negotiable):**
+- Output ONLY the final answer text itself - exactly what the user should paste.
+- Never include headings, section labels, or scaffolding such as "Structure:", "Premise 1:", "Conclusion:", "Question:", "Answer:", "Why it's correct".
+- Never explain, justify, or comment on your own answer, the marking scheme, the rubric, or the exam.
+- Never write phrases like "this is correct because", "the rubric rewards", or "ready to paste".
+- No preamble ("Here is...", "Sure,") and no closing commentary.
+- Markdown is allowed for emphasis inside the answer, but nothing outside the answer.`;
+
 function buildSystemPrompt(promptParts, customPrompt = '', googleSearchEnabled = true) {
     const sections = [promptParts.intro, '\n\n', promptParts.formatRequirements];
 
@@ -209,7 +218,16 @@ function buildSystemPrompt(promptParts, customPrompt = '', googleSearchEnabled =
         sections.push('\n\n', promptParts.searchUsage);
     }
 
-    sections.push('\n\n', promptParts.content, '\n\nUser-provided context\n-----\n', customPrompt, '\n-----\n\n', promptParts.outputInstructions);
+    sections.push(
+        '\n\n',
+        promptParts.content,
+        '\n\nUser-provided context\n-----\n',
+        customPrompt,
+        '\n-----\n\n',
+        promptParts.outputInstructions,
+        '\n\n',
+        PASTE_READY_RULE
+    );
 
     return sections.join('');
 }

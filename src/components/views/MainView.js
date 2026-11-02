@@ -702,6 +702,12 @@ export class MainView extends LitElement {
         _groqModel: { state: true },
         _groqImageModel: { state: true },
         _disableGroqThinking: { state: true },
+        _openrouterKey: { state: true },
+        _openrouterModel: { state: true },
+        _openrouterImageModel: { state: true },
+        _deepseekKey: { state: true },
+        _deepseekModel: { state: true },
+        _liveAudioEnabled: { state: true },
         _tokenError: { state: true },
         _keyError: { state: true },
         // Local AI state
@@ -731,6 +737,12 @@ export class MainView extends LitElement {
         this._groqModel = 'qwen/qwen3.6-27b';
         this._groqImageModel = 'qwen/qwen3.6-27b';
         this._disableGroqThinking = true;
+        this._openrouterKey = '';
+        this._openrouterModel = 'qwen/qwen3-235b-a22b';
+        this._openrouterImageModel = 'google/gemini-2.5-flash';
+        this._deepseekKey = '';
+        this._deepseekModel = 'deepseek-chat';
+        this._liveAudioEnabled = false;
         this._tokenError = false;
         this._keyError = false;
         this._showLocalHelp = false;
@@ -771,6 +783,12 @@ export class MainView extends LitElement {
             this._groqModel = config.groqModel || 'qwen/qwen3.6-27b';
             this._groqImageModel = config.groqImageModel || 'qwen/qwen3.6-27b';
             this._disableGroqThinking = config.disableGroqThinking === true;
+            this._openrouterKey = (await cheatingDaddy.storage.getOpenRouterApiKey().catch(() => '')) || '';
+            this._openrouterModel = config.openrouterModel || 'qwen/qwen3-235b-a22b';
+            this._openrouterImageModel = config.openrouterImageModel || 'google/gemini-2.5-flash';
+            this._deepseekKey = (await cheatingDaddy.storage.getDeepSeekApiKey().catch(() => '')) || '';
+            this._deepseekModel = config.deepseekModel || 'deepseek-chat';
+            this._liveAudioEnabled = prefs.liveAudioEnabled === true;
 
             // Load local AI settings
             this._localLlmModel = prefs.localLlmModel || 'unsloth/Qwen3.5-4B-GGUF:Q4_K_M';
@@ -966,6 +984,42 @@ export class MainView extends LitElement {
     async _saveDisableGroqThinking(disabled) {
         this._disableGroqThinking = disabled;
         await cheatingDaddy.storage.updateConfig('disableGroqThinking', disabled);
+        this.requestUpdate();
+    }
+
+    async _saveOpenRouterKey(val) {
+        this._openrouterKey = val;
+        await cheatingDaddy.storage.setOpenRouterApiKey(val);
+        this.requestUpdate();
+    }
+
+    async _saveOpenRouterModel(val) {
+        this._openrouterModel = val;
+        await cheatingDaddy.storage.updateConfig('openrouterModel', val);
+        this.requestUpdate();
+    }
+
+    async _saveOpenRouterImageModel(val) {
+        this._openrouterImageModel = val;
+        await cheatingDaddy.storage.updateConfig('openrouterImageModel', val);
+        this.requestUpdate();
+    }
+
+    async _saveDeepSeekKey(val) {
+        this._deepseekKey = val;
+        await cheatingDaddy.storage.setDeepSeekApiKey(val);
+        this.requestUpdate();
+    }
+
+    async _saveDeepSeekModel(val) {
+        this._deepseekModel = val;
+        await cheatingDaddy.storage.updateConfig('deepseekModel', val);
+        this.requestUpdate();
+    }
+
+    async _saveLiveAudioEnabled(checked) {
+        this._liveAudioEnabled = checked;
+        await cheatingDaddy.storage.updatePreference('liveAudioEnabled', checked);
         this.requestUpdate();
     }
 
@@ -1230,6 +1284,81 @@ export class MainView extends LitElement {
                     <div class="config-note">
                         If the Groq API key is empty, Gemini Live is used for answers instead. Its answer quality may be lower.
                     </div>
+                </div>
+            </details>
+
+            <details class="config-section">
+                <summary class="config-summary">
+                    <span class="config-summary-text">
+                        <span class="config-summary-title">OpenRouter</span>
+                        <span class="config-summary-description">OpenRouter key and models (text + vision)</span>
+                    </span>
+                    ${this._renderConfigChevron()}
+                </summary>
+                <div class="config-content">
+                    <div class="form-group">
+                        <label class="form-label">OpenRouter API Key</label>
+                        <input
+                            type="password"
+                            placeholder="Optional"
+                            .value=${this._openrouterKey}
+                            @input=${e => this._saveOpenRouterKey(e.target.value)}
+                        />
+                        <div class="form-hint">
+                            <span class="link" @click=${() => this.onExternalLink('https://openrouter.ai/keys')}>Get OpenRouter key</span>
+                        </div>
+                    </div>
+
+                    <div class="form-group">
+                        <label class="form-label">Text Model</label>
+                        <input type="text" .value=${this._openrouterModel} @input=${e => this._saveOpenRouterModel(e.target.value)} />
+                    </div>
+
+                    <div class="form-group">
+                        <label class="form-label">Image Model</label>
+                        <input type="text" .value=${this._openrouterImageModel} @input=${e => this._saveOpenRouterImageModel(e.target.value)} />
+                    </div>
+
+                    <label class="config-checkbox">
+                        <input type="checkbox" .checked=${this._liveAudioEnabled} @change=${e => this._saveLiveAudioEnabled(e.target.checked)} />
+                        <span class="config-checkbox-text">
+                            <span class="config-summary-title">Live audio (Gemini)</span>
+                            <span class="config-summary-description"
+                                >Use the Gemini live audio session (off = screen text is extracted and answered by the text model)</span
+                            >
+                        </span>
+                    </label>
+                </div>
+            </details>
+
+            <details class="config-section">
+                <summary class="config-summary">
+                    <span class="config-summary-text">
+                        <span class="config-summary-title">DeepSeek</span>
+                        <span class="config-summary-description">DeepSeek key and text model (primary answerer)</span>
+                    </span>
+                    ${this._renderConfigChevron()}
+                </summary>
+                <div class="config-content">
+                    <div class="form-group">
+                        <label class="form-label">DeepSeek API Key</label>
+                        <input
+                            type="password"
+                            placeholder="Optional"
+                            .value=${this._deepseekKey}
+                            @input=${e => this._saveDeepSeekKey(e.target.value)}
+                        />
+                        <div class="form-hint">
+                            <span class="link" @click=${() => this.onExternalLink('https://platform.deepseek.com')}>Get DeepSeek key</span>
+                        </div>
+                    </div>
+
+                    <div class="form-group">
+                        <label class="form-label">Text Model</label>
+                        <input type="text" .value=${this._deepseekModel} @input=${e => this._saveDeepSeekModel(e.target.value)} />
+                    </div>
+
+                    <div class="config-note">DeepSeek answers the screen text first; falls back to Groq then OpenRouter if it fails.</div>
                 </div>
             </details>
 

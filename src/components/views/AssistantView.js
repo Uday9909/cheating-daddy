@@ -54,12 +54,22 @@ export class AssistantView extends LitElement {
             font-weight: var(--font-weight-semibold);
         }
 
-        .response-container h1 { font-size: 1.5em; }
-        .response-container h2 { font-size: 1.3em; }
-        .response-container h3 { font-size: 1.15em; }
-        .response-container h4 { font-size: 1.05em; }
+        .response-container h1 {
+            font-size: 1.5em;
+        }
+        .response-container h2 {
+            font-size: 1.3em;
+        }
+        .response-container h3 {
+            font-size: 1.15em;
+        }
+        .response-container h4 {
+            font-size: 1.05em;
+        }
         .response-container h5,
-        .response-container h6 { font-size: 1em; }
+        .response-container h6 {
+            font-size: 1em;
+        }
 
         .response-container p {
             margin: 0.6em 0;
@@ -263,7 +273,9 @@ export class AssistantView extends LitElement {
             display: flex;
             align-items: center;
             gap: 4px;
-            transition: border-color 0.4s ease, background var(--transition);
+            transition:
+                border-color 0.4s ease,
+                background var(--transition);
             flex-shrink: 0;
             overflow: hidden;
         }
@@ -298,6 +310,39 @@ export class AssistantView extends LitElement {
             height: calc(100% + 2px);
             pointer-events: none;
         }
+
+        .autowrite-btn {
+            background: var(--bg-elevated);
+            border: 1px solid var(--border);
+            color: var(--text-primary);
+            cursor: pointer;
+            font-size: var(--font-size-xs);
+            font-family: var(--font-mono);
+            white-space: nowrap;
+            padding: var(--space-xs) var(--space-md);
+            border-radius: 100px;
+            height: 32px;
+            flex-shrink: 0;
+            transition:
+                border-color 0.4s ease,
+                color 0.4s ease,
+                background var(--transition);
+        }
+
+        .autowrite-btn:hover {
+            border-color: var(--accent);
+            background: var(--bg-surface);
+        }
+
+        .autowrite-btn.writing {
+            border-color: var(--accent);
+            color: var(--accent);
+        }
+
+        .autowrite-btn.stop {
+            color: #ff6b6b;
+            border-color: currentColor;
+        }
     `;
 
     static properties = {
@@ -307,6 +352,10 @@ export class AssistantView extends LitElement {
         onSendText: { type: Function },
         shouldAnimateResponse: { type: Boolean },
         isAnalyzing: { type: Boolean, state: true },
+        isAutoWriting: { type: Boolean, state: true },
+        autoWritePaused: { type: Boolean, state: true },
+        autoWriteProgress: { type: Number, state: true },
+        autoWriteStatus: { type: String, state: true },
     };
 
     constructor() {
@@ -316,6 +365,11 @@ export class AssistantView extends LitElement {
         this.selectedProfile = 'interview';
         this.onSendText = () => {};
         this.isAnalyzing = false;
+        this.isAutoWriting = false;
+        this.autoWritePaused = false;
+        this.autoWriteProgress = 0;
+        this.autoWriteStatus = '';
+        this._isStartingAutoWrite = false;
         this._animFrame = null;
     }
 
@@ -335,6 +389,116 @@ export class AssistantView extends LitElement {
         return this.responses.length > 0 && this.currentResponseIndex >= 0
             ? this.responses[this.currentResponseIndex]
             : `Listening to your ${profileNames[this.selectedProfile] || 'session'}...`;
+    }
+
+    getAutoWriteLabel() {
+        if (!this.isAutoWriting) return this.autoWriteStatus || 'Auto-Write';
+        return this.autoWritePaused ? 'Resume' : `Pause ${Math.round(this.autoWriteProgress || 0)}%`;
+    }
+
+    async handleAutoWriteStop() {
+        const api = window.cheatingDaddy?.autoWrite;
+        if (!api) return;
+        await api.stop();
+        this.isAutoWriting = false;
+        this.autoWritePaused = false;
+        this.autoWriteProgress = 0;
+        this.autoWriteStatus = '';
+    }
+
+    async handleAutoWriteToggle(explicitText = null, explicitType = null, fromButton = false) {
+        const cheatingDaddy = window.cheatingDaddy;
+        const api = cheatingDaddy?.autoWrite;
+        if (!api) {
+            cheatingDaddy?.setStatus('Auto-write unavailable');
+            return;
+        }
+
+        // Ignore a second click while the start request is still in flight.
+        if (this._isStartingAutoWrite) return;
+
+        // The main process owns the real state; never infer pause/stop from a stale UI flag.
+        const status = await api.status();
+        if (status.isWriting) {
+            if (status.isPaused) {
+                const res = await api.resume();
+                if (res && res.resumed) {
+                    this.autoWritePaused = false;
+                    this.autoWriteStatus = 'Typing...';
+                }
+            } else {
+                const res = await api.pause();
+                if (res && res.paused) {
+                    this.autoWritePaused = true;
+                    this.autoWriteStatus = 'Paused';
+                }
+            }
+            return;
+        }
+
+        const text = explicitText || this.getCurrentResponse();
+        if (!text || !text.trim() || text.startsWith('Listening to your')) {
+            cheatingDaddy.setStatus('No answer available to auto-write');
+            return;
+        }
+
+        this._isStartingAutoWrite = true;
+        setTimeout(() => {
+            this._isStartingAutoWrite = false;
+        }, 300);
+
+        try {
+            const prefs = await cheatingDaddy.storage.getPreferences();
+            const targetType = explicitType || prefs.autoWriteTarget || 'auto';
+            const speed = prefs.autoWriteSpeed || '150wpm';
+            const startDelayMs = Number.isFinite(Number(prefs.autoWriteDelay)) ? Number(prefs.autoWriteDelay) : 500;
+
+            const content = await api.extract(text, { contentType: targetType });
+            if (!content.text || !content.text.trim()) {
+                cheatingDaddy.setStatus('Nothing to auto-write');
+                return;
+            }
+
+            this.isAutoWriting = true;
+            this.autoWritePaused = false;
+            this.autoWriteProgress = 0;
+            this.autoWriteStatus = 'Starting...';
+            cheatingDaddy.setStatus(
+                cheatingDaddy.isMacOS
+                    ? 'Auto-writing... (hold Option to pause, cancel key stops)'
+                    : 'Auto-writing... (hotkey pauses, cancel key stops)'
+            );
+
+            const result = await api.start(content.text, {
+                mode: 'type',
+                speed,
+                startDelayMs,
+                contentType: content.type,
+                language: content.language || '',
+                hideOverlay: fromButton,
+            });
+
+            if (result && result.success) {
+                this.autoWriteStatus = 'Done!';
+            } else if (result && result.cancelled) {
+                this.autoWriteStatus = 'Cancelled';
+            } else {
+                this.autoWriteStatus = 'Failed';
+                cheatingDaddy.setStatus(`Auto-write error: ${(result && result.error) || 'failed'}`);
+            }
+        } catch (error) {
+            this.autoWriteStatus = 'Failed';
+            cheatingDaddy.setStatus(`Auto-write error: ${error.message}`);
+        } finally {
+            this._isStartingAutoWrite = false;
+            setTimeout(() => {
+                if (!this.isConnected) return;
+                this.isAutoWriting = false;
+                this.autoWritePaused = false;
+                this.autoWriteProgress = 0;
+                this.autoWriteStatus = '';
+            }, 1600);
+        }
     }
 
     renderMarkdown(content) {
@@ -434,11 +598,45 @@ export class AssistantView extends LitElement {
             this.handleNextResponse = () => this.navigateToNextResponse();
             this.handleScrollUp = () => this.scrollResponseUp();
             this.handleScrollDown = () => this.scrollResponseDown();
+            this.handleAutoWriteProgress = (event, progress = {}) => {
+                if (progress.percent !== undefined) {
+                    this.autoWriteProgress = progress.percent;
+                    if (progress.percent >= 100) this.isAutoWriting = false;
+                }
+                if (progress.status && progress.status !== this.autoWriteStatus) {
+                    this.autoWriteStatus = progress.status;
+                }
+            };
+            this.handleAutoWriteState = (event, state = {}) => {
+                if (typeof state.isWriting === 'boolean') {
+                    this.isAutoWriting = state.isWriting;
+                    if (state.isWriting) {
+                        this._isStartingAutoWrite = false;
+                    } else {
+                        this.autoWritePaused = false;
+                    }
+                }
+                if (typeof state.isPaused === 'boolean') {
+                    this.autoWritePaused = state.isPaused;
+                }
+                if (typeof state.percent === 'number') {
+                    this.autoWriteProgress = state.percent;
+                }
+            };
+            this.handleAutoWriteStopped = () => {
+                this.isAutoWriting = false;
+                this.autoWritePaused = false;
+                this.autoWriteProgress = 0;
+                this.autoWriteStatus = '';
+            };
 
             ipcRenderer.on('navigate-previous-response', this.handlePreviousResponse);
             ipcRenderer.on('navigate-next-response', this.handleNextResponse);
             ipcRenderer.on('scroll-response-up', this.handleScrollUp);
             ipcRenderer.on('scroll-response-down', this.handleScrollDown);
+            ipcRenderer.on('autowrite-progress', this.handleAutoWriteProgress);
+            ipcRenderer.on('autowrite-state', this.handleAutoWriteState);
+            ipcRenderer.on('autowrite-stopped', this.handleAutoWriteStopped);
         }
     }
 
@@ -452,6 +650,9 @@ export class AssistantView extends LitElement {
             if (this.handleNextResponse) ipcRenderer.removeListener('navigate-next-response', this.handleNextResponse);
             if (this.handleScrollUp) ipcRenderer.removeListener('scroll-response-up', this.handleScrollUp);
             if (this.handleScrollDown) ipcRenderer.removeListener('scroll-response-down', this.handleScrollDown);
+            if (this.handleAutoWriteProgress) ipcRenderer.removeListener('autowrite-progress', this.handleAutoWriteProgress);
+            if (this.handleAutoWriteState) ipcRenderer.removeListener('autowrite-state', this.handleAutoWriteState);
+            if (this.handleAutoWriteStopped) ipcRenderer.removeListener('autowrite-stopped', this.handleAutoWriteStopped);
         }
     }
 
@@ -465,6 +666,12 @@ export class AssistantView extends LitElement {
     }
 
     handleTextKeydown(e) {
+        if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
+            // Cmd/Ctrl+Enter = analyze screen, not send text
+            e.preventDefault();
+            this.handleScreenAnswer();
+            return;
+        }
         if (e.key === 'Enter' && !e.shiftKey) {
             e.preventDefault();
             this.handleSendText();
@@ -506,7 +713,7 @@ export class AssistantView extends LitElement {
         const perimeter = 2 * straightLen + 2 * arcLen;
 
         // Given a distance along the perimeter, return {x, y, nx, ny} (position + inward normal)
-        const pointOnPerimeter = (d) => {
+        const pointOnPerimeter = d => {
             d = ((d % perimeter) + perimeter) % perimeter;
             // Top straight: left to right
             if (d < straightLen) {
@@ -545,7 +752,7 @@ export class AssistantView extends LitElement {
             seeds.push({ pos: Math.random(), drift: Math.random(), depthSeed: Math.random() });
         }
 
-        const draw = (now) => {
+        const draw = now => {
             const elapsed = (now - startTime) / 1000;
             const fade = Math.min(1, elapsed / FADE_IN);
 
@@ -670,40 +877,76 @@ export class AssistantView extends LitElement {
         return html`
             <div class="response-container" id="responseContainer"></div>
 
-            ${hasMultipleResponses ? html`
-                <div class="response-nav">
-                    <button class="nav-btn" @click=${this.navigateToPreviousResponse} ?disabled=${this.currentResponseIndex <= 0} title="Previous response">
-                        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor">
-                            <path fill-rule="evenodd" d="M11.78 5.22a.75.75 0 0 1 0 1.06L8.06 10l3.72 3.72a.75.75 0 1 1-1.06 1.06l-4.25-4.25a.75.75 0 0 1 0-1.06l4.25-4.25a.75.75 0 0 1 1.06 0Z" clip-rule="evenodd" />
-                        </svg>
-                    </button>
-                    <span class="response-counter">${this.currentResponseIndex + 1} of ${this.responses.length}</span>
-                    <button class="nav-btn" @click=${this.navigateToNextResponse} ?disabled=${this.currentResponseIndex >= this.responses.length - 1} title="Next response">
-                        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor">
-                            <path fill-rule="evenodd" d="M8.22 5.22a.75.75 0 0 1 1.06 0l4.25 4.25a.75.75 0 0 1 0 1.06l-4.25 4.25a.75.75 0 0 1-1.06-1.06L11.94 10 8.22 6.28a.75.75 0 0 1 0-1.06Z" clip-rule="evenodd" />
-                        </svg>
-                    </button>
-                </div>
-            ` : ''}
+            ${
+                hasMultipleResponses
+                    ? html`
+                          <div class="response-nav">
+                              <button
+                                  class="nav-btn"
+                                  @click=${this.navigateToPreviousResponse}
+                                  ?disabled=${this.currentResponseIndex <= 0}
+                                  title="Previous response"
+                              >
+                                  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor">
+                                      <path
+                                          fill-rule="evenodd"
+                                          d="M11.78 5.22a.75.75 0 0 1 0 1.06L8.06 10l3.72 3.72a.75.75 0 1 1-1.06 1.06l-4.25-4.25a.75.75 0 0 1 0-1.06l4.25-4.25a.75.75 0 0 1 1.06 0Z"
+                                          clip-rule="evenodd"
+                                      />
+                                  </svg>
+                              </button>
+                              <span class="response-counter">${this.currentResponseIndex + 1} of ${this.responses.length}</span>
+                              <button
+                                  class="nav-btn"
+                                  @click=${this.navigateToNextResponse}
+                                  ?disabled=${this.currentResponseIndex >= this.responses.length - 1}
+                                  title="Next response"
+                              >
+                                  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor">
+                                      <path
+                                          fill-rule="evenodd"
+                                          d="M8.22 5.22a.75.75 0 0 1 1.06 0l4.25 4.25a.75.75 0 0 1 0 1.06l-4.25 4.25a.75.75 0 0 1-1.06-1.06L11.94 10 8.22 6.28a.75.75 0 0 1 0-1.06Z"
+                                          clip-rule="evenodd"
+                                      />
+                                  </svg>
+                              </button>
+                          </div>
+                      `
+                    : ''
+            }
 
             <div class="input-bar">
                 <div class="input-bar-inner">
-                    <input
-                        type="text"
-                        id="textInput"
-                        placeholder="Type a message..."
-                        @keydown=${this.handleTextKeydown}
-                    />
+                    <input type="text" id="textInput" placeholder="Type a message..." @keydown=${this.handleTextKeydown} />
                 </div>
                 <button class="analyze-btn ${this.isAnalyzing ? 'analyzing' : ''}" @click=${this.handleScreenAnswer}>
                     <canvas class="analyze-canvas"></canvas>
                     <span class="analyze-btn-content">
                         <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24">
-                            <path fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 3v7h6l-8 11v-7H5z" />
+                            <path
+                                fill="none"
+                                stroke="currentColor"
+                                stroke-linecap="round"
+                                stroke-linejoin="round"
+                                stroke-width="2"
+                                d="M13 3v7h6l-8 11v-7H5z"
+                            />
                         </svg>
                         Analyze Screen
                     </span>
                 </button>
+                <button
+                    class="autowrite-btn ${this.isAutoWriting ? 'writing' : ''}"
+                    @click=${() => this.handleAutoWriteToggle(null, null, true)}
+                    title=${this.isAutoWriting ? 'Pause or resume auto-writing' : 'Type the answer into the focused app'}
+                >
+                    ${this.getAutoWriteLabel()}
+                </button>
+                ${
+                    this.isAutoWriting
+                        ? html`<button class="autowrite-btn stop" @click=${() => this.handleAutoWriteStop()} title="Stop auto-writing">Stop</button>`
+                        : ''
+                }
             </div>
         `;
     }

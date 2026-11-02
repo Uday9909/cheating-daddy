@@ -1,6 +1,7 @@
 const { BrowserWindow, globalShortcut, ipcMain, screen } = require('electron');
 const path = require('node:path');
 const storage = require('../storage');
+const autoWriter = require('./autoWriter');
 
 let mouseEventsIgnored = false;
 
@@ -104,6 +105,8 @@ function getDefaultKeybinds() {
         scrollUp: isMac ? 'Cmd+Shift+Up' : 'Ctrl+Shift+Up',
         scrollDown: isMac ? 'Cmd+Shift+Down' : 'Ctrl+Shift+Down',
         emergencyErase: isMac ? 'Cmd+Shift+E' : 'Ctrl+Shift+E',
+        autoWrite: isMac ? 'Option+\\' : 'Alt+\\',
+        autoWriteCancel: isMac ? 'Cmd+Option+D' : 'Alt+D',
     };
 }
 
@@ -112,6 +115,9 @@ function updateGlobalShortcuts(keybinds, mainWindow, sendToRenderer, geminiSessi
 
     // Unregister all existing shortcuts
     globalShortcut.unregisterAll();
+
+    // Saved keybind maps predate newer keys; merge defaults so they still register
+    keybinds = { ...getDefaultKeybinds(), ...keybinds };
 
     const primaryDisplay = screen.getPrimaryDisplay();
     const { width, height } = primaryDisplay.workAreaSize;
@@ -288,6 +294,65 @@ function updateGlobalShortcuts(keybinds, mainWindow, sendToRenderer, geminiSessi
             console.log(`Registered emergencyErase: ${keybinds.emergencyErase}`);
         } catch (error) {
             console.error(`Failed to register emergencyErase (${keybinds.emergencyErase}):`, error);
+        }
+    }
+
+    // Register auto-write shortcut (pause/resume while writing, otherwise ask the renderer to type)
+    if (keybinds.autoWrite) {
+        try {
+            const cancelKey = keybinds.autoWriteCancel || (process.platform === 'darwin' ? 'Cmd+Alt+D' : 'Alt+D');
+            const registeredAutoWrite = globalShortcut.register(keybinds.autoWrite, () => {
+                if (!mainWindow || mainWindow.isDestroyed()) return;
+
+                if (autoWriter.isAutoWriting()) {
+                    if (!autoWriter.isAutoWritePaused()) {
+                        if (autoWriter.pauseAutoWrite()) {
+                            sendToRenderer('update-status', `Auto-write PAUSED (Press ${keybinds.autoWrite} to resume, ${cancelKey} to cancel)`);
+                            sendToRenderer('autowrite-progress', { status: 'Paused' });
+                        }
+                    } else if (autoWriter.resumeAutoWrite()) {
+                        sendToRenderer('update-status', 'Auto-write resumed...');
+                        sendToRenderer('autowrite-progress', { status: 'Typing...' });
+                    }
+                    sendToRenderer('autowrite-state', {
+                        isWriting: autoWriter.isAutoWriting(),
+                        isPaused: autoWriter.isAutoWritePaused(),
+                    });
+                    return;
+                }
+
+                sendToRenderer('trigger-autowrite', {});
+            });
+            if (registeredAutoWrite) {
+                console.log(`Registered autoWrite: ${keybinds.autoWrite}`);
+            } else {
+                console.error(`Failed to register autoWrite (${keybinds.autoWrite}): shortcut unavailable`);
+                sendToRenderer('update-status', `Auto-write hotkey ${keybinds.autoWrite} is unavailable — hold Option to pause while typing`);
+            }
+        } catch (error) {
+            console.error(`Failed to register autoWrite (${keybinds.autoWrite}):`, error);
+        }
+    }
+
+    // Register auto-write cancel shortcut
+    if (keybinds.autoWriteCancel) {
+        try {
+            const registeredAutoWriteCancel = globalShortcut.register(keybinds.autoWriteCancel, () => {
+                if (!mainWindow || mainWindow.isDestroyed()) return;
+                if (!autoWriter.isAutoWriting()) return;
+
+                autoWriter.stopAutoWrite();
+                sendToRenderer('update-status', 'Auto-write cancelled');
+                sendToRenderer('autowrite-stopped', { stopped: true });
+                sendToRenderer('autowrite-state', { isWriting: false, isPaused: false });
+            });
+            if (registeredAutoWriteCancel) {
+                console.log(`Registered autoWriteCancel: ${keybinds.autoWriteCancel}`);
+            } else {
+                console.error(`Failed to register autoWriteCancel (${keybinds.autoWriteCancel}): shortcut unavailable`);
+            }
+        } catch (error) {
+            console.error(`Failed to register autoWriteCancel (${keybinds.autoWriteCancel}):`, error);
         }
     }
 }

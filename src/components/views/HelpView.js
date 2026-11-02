@@ -73,7 +73,10 @@ export class HelpView extends LitElement {
                 color: var(--text-primary);
                 font-size: var(--font-size-sm);
                 cursor: pointer;
-                transition: border-color var(--transition), color var(--transition), background var(--transition);
+                transition:
+                    border-color var(--transition),
+                    color var(--transition),
+                    background var(--transition);
             }
 
             .link-button:hover {
@@ -87,7 +90,6 @@ export class HelpView extends LitElement {
                     grid-template-columns: 1fr;
                 }
             }
-
         `,
     ];
 
@@ -129,6 +131,8 @@ export class HelpView extends LitElement {
             nextResponse: isMac ? 'Cmd+]' : 'Ctrl+]',
             scrollUp: isMac ? 'Cmd+Shift+Up' : 'Ctrl+Shift+Up',
             scrollDown: isMac ? 'Cmd+Shift+Down' : 'Ctrl+Shift+Down',
+            autoWrite: isMac ? 'Option+\\' : 'Alt+\\',
+            autoWriteCancel: isMac ? 'Cmd+Option+D' : 'Alt+D',
         };
     }
 
@@ -153,6 +157,8 @@ export class HelpView extends LitElement {
             ['Next Response', this.keybinds.nextResponse],
             ['Scroll Response Up', this.keybinds.scrollUp],
             ['Scroll Response Down', this.keybinds.scrollDown],
+            ['Auto-Write Answer', this.keybinds.autoWrite],
+            ['Cancel Auto-Write', this.keybinds.autoWriteCancel],
         ];
 
         return html`
@@ -172,12 +178,14 @@ export class HelpView extends LitElement {
                     <section class="surface">
                         <div class="surface-title">Keyboard Shortcuts</div>
                         <div class="shortcut-grid">
-                            ${shortcutRows.map(([label, keys]) => html`
-                                <div class="shortcut-row">
-                                    <span class="shortcut-label">${label}</span>
-                                    <span class="shortcut-keys">${this._formatKeybind(keys)}</span>
-                                </div>
-                            `)}
+                            ${shortcutRows.map(
+                                ([label, keys]) => html`
+                                    <div class="shortcut-row">
+                                        <span class="shortcut-label">${label}</span>
+                                        <span class="shortcut-keys">${this._formatKeybind(keys)}</span>
+                                    </div>
+                                `
+                            )}
                         </div>
                     </section>
                 </div>

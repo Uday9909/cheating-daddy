@@ -13,11 +13,17 @@ const DEFAULT_CONFIG = {
     groqModel: 'qwen/qwen3.6-27b',
     groqImageModel: 'qwen/qwen3.6-27b',
     disableGroqThinking: true,
+    openrouterModel: 'google/gemma-4-26b-a4b-it:free',
+    openrouterImageModel: 'google/gemma-4-26b-a4b-it:free',
+    deepseekModel: 'deepseek-chat',
+    deepseekVisionModel: 'deepseek-v4-flash-vision-exp',
 };
 
 const DEFAULT_CREDENTIALS = {
     apiKey: '',
     groqApiKey: '',
+    openrouterApiKey: '',
+    deepseekApiKey: '',
 };
 
 const DEFAULT_PREFERENCES = {
@@ -34,6 +40,10 @@ const DEFAULT_PREFERENCES = {
     googleSearchEnabled: false,
     localLlmModel: 'unsloth/Qwen3.5-4B-GGUF:Q4_K_M',
     whisperModel: 'tiny.en',
+    liveAudioEnabled: false,
+    autoWriteSpeed: '150wpm',
+    autoWriteTarget: 'auto',
+    autoWriteDelay: 500,
 };
 
 const DEFAULT_KEYBINDS = null; // null means use system defaults
@@ -209,6 +219,22 @@ function setGroqApiKey(groqApiKey) {
     return setCredentials({ groqApiKey });
 }
 
+function getOpenRouterApiKey() {
+    return getCredentials().openrouterApiKey || '';
+}
+
+function setOpenRouterApiKey(openrouterApiKey) {
+    return setCredentials({ openrouterApiKey });
+}
+
+function getDeepSeekApiKey() {
+    return getCredentials().deepseekApiKey || '';
+}
+
+function setDeepSeekApiKey(deepseekApiKey) {
+    return setCredentials({ deepseekApiKey });
+}
+
 // ============ PREFERENCES ============
 
 function getPreferences() {
@@ -239,7 +265,18 @@ function updatePreference(key, value) {
 // ============ KEYBINDS ============
 
 function getKeybinds() {
-    return readJsonFile(getKeybindsPath(), DEFAULT_KEYBINDS);
+    const keybinds = readJsonFile(getKeybindsPath(), DEFAULT_KEYBINDS);
+    if (!keybinds) return keybinds;
+
+    // Old default conflicted with macOS fullscreen (Cmd+Option closes windows). Migrate only
+    // that exact value; any custom binding the user chose is left untouched.
+    const isMac = os.platform() === 'darwin';
+    const legacyAutoWrite = isMac ? 'Cmd+Option+W' : 'Ctrl+Alt+W';
+    if (keybinds.autoWrite !== legacyAutoWrite) return keybinds;
+
+    const migrated = { ...keybinds, autoWrite: isMac ? 'Option+\\' : 'Alt+\\' };
+    writeJsonFile(getKeybindsPath(), migrated);
+    return migrated;
 }
 
 function setKeybinds(keybinds) {
@@ -513,6 +550,10 @@ module.exports = {
     setApiKey,
     getGroqApiKey,
     setGroqApiKey,
+    getOpenRouterApiKey,
+    setOpenRouterApiKey,
+    getDeepSeekApiKey,
+    setDeepSeekApiKey,
 
     // Preferences
     getPreferences,
