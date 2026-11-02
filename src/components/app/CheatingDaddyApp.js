@@ -636,7 +636,10 @@ export class CheatingDaddyApp extends LitElement {
                 return;
             }
 
-            await cheatingDaddy.initializeGemini(this.selectedProfile, this.selectedLanguage);
+            // Live audio off: skip opening the live Gemini session (screen-only capture + text provider)
+            if (prefs.liveAudioEnabled !== false) {
+                await cheatingDaddy.initializeGemini(this.selectedProfile, this.selectedLanguage);
+            }
         }
 
         cheatingDaddy.startCapture(this.selectedScreenshotInterval, this.selectedImageQuality);

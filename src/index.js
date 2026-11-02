@@ -2,10 +2,11 @@ if (require('electron-squirrel-startup')) {
     process.exit(0);
 }
 
-const { app, BrowserWindow, shell, ipcMain } = require('electron');
+const { app, BrowserWindow, shell, ipcMain, systemPreferences } = require('electron');
 const { createWindow, updateGlobalShortcuts } = require('./utils/window');
 const { setupGeminiIpcHandlers, stopMacOSAudioCapture, sendToRenderer } = require('./utils/gemini');
 const storage = require('./storage');
+const autoWriter = require('./utils/autoWriter');
 
 const geminiSessionRef = { current: null };
 let mainWindow = null;
@@ -32,6 +33,7 @@ app.whenReady().then(async () => {
 });
 
 app.on('window-all-closed', () => {
+    autoWriter.stopAutoWrite();
     stopMacOSAudioCapture();
     if (process.platform !== 'darwin') {
         app.quit();
@@ -39,6 +41,7 @@ app.on('window-all-closed', () => {
 });
 
 app.on('before-quit', () => {
+    autoWriter.stopAutoWrite();
     stopMacOSAudioCapture();
     require('./utils/localai').closeLocalSession();
 });
@@ -134,6 +137,44 @@ function setupStorageIpcHandlers() {
             return { success: true };
         } catch (error) {
             console.error('Error setting Groq API key:', error);
+            return { success: false, error: error.message };
+        }
+    });
+
+    ipcMain.handle('storage:get-openrouter-api-key', async () => {
+        try {
+            return { success: true, data: storage.getOpenRouterApiKey() };
+        } catch (error) {
+            console.error('Error getting OpenRouter API key:', error);
+            return { success: false, error: error.message };
+        }
+    });
+
+    ipcMain.handle('storage:set-openrouter-api-key', async (event, openrouterApiKey) => {
+        try {
+            storage.setOpenRouterApiKey(openrouterApiKey);
+            return { success: true };
+        } catch (error) {
+            console.error('Error setting OpenRouter API key:', error);
+            return { success: false, error: error.message };
+        }
+    });
+
+    ipcMain.handle('storage:get-deepseek-api-key', async () => {
+        try {
+            return { success: true, data: storage.getDeepSeekApiKey() };
+        } catch (error) {
+            console.error('Error getting DeepSeek API key:', error);
+            return { success: false, error: error.message };
+        }
+    });
+
+    ipcMain.handle('storage:set-deepseek-api-key', async (event, deepseekApiKey) => {
+        try {
+            storage.setDeepSeekApiKey(deepseekApiKey);
+            return { success: true };
+        } catch (error) {
+            console.error('Error setting DeepSeek API key:', error);
             return { success: false, error: error.message };
         }
     });
@@ -283,6 +324,93 @@ function setupGeneralIpcHandlers() {
             console.error('Error opening external URL:', error);
             return { success: false, error: error.message };
         }
+    });
+
+    // Auto-write handlers
+    ipcMain.handle('autowrite:extract', (event, text, options) => {
+        try {
+            return { success: true, data: autoWriter.extractWritableContent(text, options) };
+        } catch (error) {
+            console.error('[AutoWrite IPC] Error extracting writable content:', error);
+            return { success: false, error: error.message };
+        }
+    });
+
+    ipcMain.handle('autowrite:start', async (event, text, options) => {
+        try {
+            if (process.platform === 'darwin' && !systemPreferences.isTrustedAccessibilityClient(true)) {
+                return {
+                    success: false,
+                    error: 'Accessibility permission required. Enable this app in System Settings > Privacy & Security > Accessibility, then retry.',
+                };
+            }
+
+            if (options && options.hideOverlay && mainWindow && !mainWindow.isDestroyed()) {
+                mainWindow.hide();
+            }
+
+            const result = await autoWriter.startAutoWrite(text, options, progress => {
+                sendToRenderer('autowrite-progress', progress);
+                sendToRenderer('autowrite-state', {
+                    isWriting: autoWriter.isAutoWriting(),
+                    isPaused: autoWriter.isAutoWritePaused(),
+                    percent: progress.percent,
+                });
+            });
+            sendToRenderer('autowrite-state', { isWriting: false, isPaused: false });
+            return result;
+        } catch (error) {
+            console.error('[AutoWrite IPC] Error starting auto-write:', error);
+            return { success: false, error: error.message };
+        }
+    });
+
+    ipcMain.handle('autowrite:stop', () => {
+        try {
+            const stopped = autoWriter.stopAutoWrite();
+            sendToRenderer('autowrite-stopped', { stopped });
+            sendToRenderer('autowrite-state', { isWriting: false, isPaused: false });
+            return { success: true, stopped };
+        } catch (error) {
+            console.error('[AutoWrite IPC] Error stopping auto-write:', error);
+            return { success: false, error: error.message };
+        }
+    });
+
+    ipcMain.handle('autowrite:pause', () => {
+        try {
+            const paused = autoWriter.pauseAutoWrite();
+            sendToRenderer('autowrite-state', {
+                isWriting: autoWriter.isAutoWriting(),
+                isPaused: autoWriter.isAutoWritePaused(),
+            });
+            return { success: true, paused };
+        } catch (error) {
+            console.error('[AutoWrite IPC] Error pausing auto-write:', error);
+            return { success: false, error: error.message };
+        }
+    });
+
+    ipcMain.handle('autowrite:resume', () => {
+        try {
+            const resumed = autoWriter.resumeAutoWrite();
+            sendToRenderer('autowrite-state', {
+                isWriting: autoWriter.isAutoWriting(),
+                isPaused: autoWriter.isAutoWritePaused(),
+            });
+            return { success: true, resumed };
+        } catch (error) {
+            console.error('[AutoWrite IPC] Error resuming auto-write:', error);
+            return { success: false, error: error.message };
+        }
+    });
+
+    ipcMain.handle('autowrite:status', () => {
+        return {
+            success: true,
+            isWriting: autoWriter.isAutoWriting(),
+            isPaused: autoWriter.isAutoWritePaused(),
+        };
     });
 
     ipcMain.on('update-keybinds', (event, newKeybinds) => {

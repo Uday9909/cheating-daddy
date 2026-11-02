@@ -3,7 +3,17 @@ const { BrowserWindow, ipcMain } = require('electron');
 const { spawn } = require('child_process');
 const { saveDebugAudio } = require('../audioUtils');
 const { getSystemPrompt } = require('./prompts');
-const { getAvailableModel, incrementLimitCount, getApiKey, getGroqApiKey, incrementCharUsage, getConfig } = require('../storage');
+const {
+    getAvailableModel,
+    incrementLimitCount,
+    getApiKey,
+    getGroqApiKey,
+    getOpenRouterApiKey,
+    getDeepSeekApiKey,
+    incrementCharUsage,
+    getConfig,
+    getPreferences,
+} = require('../storage');
 const { connectCloud, sendCloudAudio, sendCloudText, sendCloudImage, closeCloud, isCloudActive, setOnTurnComplete } = require('./cloud');
 const { startTransportLog, logTransportEvent, closeTransportLog } = require('./transportLogger');
 
@@ -87,6 +97,7 @@ function initializeNewSession(profile = null, customPrompt = null) {
     conversationHistory = [];
     screenAnalysisHistory = [];
     groqConversationHistory = [];
+    deepseekConversationHistory = [];
     currentProfile = profile;
     currentCustomPrompt = customPrompt;
     console.log('New conversation session started:', currentSessionId, 'profile:', profile);
@@ -211,6 +222,28 @@ function hasGroqKey() {
     return key && key.trim() != '';
 }
 
+// helper to check if openrouter has been configured
+function hasOpenRouterKey() {
+    const key = getOpenRouterApiKey();
+    return key && key.trim() != '';
+}
+
+// helper to check if deepseek has been configured
+function hasDeepSeekKey() {
+    const key = getDeepSeekApiKey();
+    return key && key.trim() != '';
+}
+
+// The live Gemini session is what normally builds the system prompt. When live audio is
+// off it never opens, so the HTTP providers (DeepSeek/Groq/OpenRouter) would fall back to
+// a bare "helpful assistant" and drop the user's context. Rebuild it from prefs instead.
+function ensureContextPrompt() {
+    if (getPreferences().liveAudioEnabled !== true) {
+        const prefs = getPreferences();
+        currentSystemPrompt = getSystemPrompt(prefs.selectedProfile || 'interview', prefs.customPrompt || '', false);
+    }
+}
+
 function sendFinalTranscriptionToGroq() {
     if (!hasGroqKey() || groqRequestStartedForTurn) {
         return;
@@ -272,16 +305,102 @@ function getGroqReasoningOptions(model, disableThinking) {
     return {};
 }
 
+// Shared OpenAI-compatible chat completions streaming (used by Groq and OpenRouter)
+async function streamOpenAiCompletions({ endpoint, apiKey, model, messages, extraBody = {}, label, prefix, emitToRenderer = true }) {
+    const response = await fetch(endpoint, {
+        method: 'POST',
+        headers: {
+            Authorization: `Bearer ${apiKey}`,
+            'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+            model,
+            messages,
+            stream: true,
+            temperature: 0.7,
+            max_completion_tokens: GROQ_MAX_COMPLETION_TOKENS,
+            ...extraBody,
+        }),
+    });
+
+    if (!response.ok) {
+        const errorText = await response.text();
+        console.error(`${label} API error:`, response.status, errorText);
+        logTransportEvent(`${prefix}.http_error`, {
+            status: response.status,
+            body: errorText,
+        });
+        return { ok: false, status: response.status, errorText };
+    }
+
+    logTransportEvent(`${prefix}.http_response`, {
+        status: response.status,
+    });
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let fullText = '';
+    let isFirst = true;
+    let finishReason = null;
+
+    let sseBuffer = '';
+
+    while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        const chunk = decoder.decode(value, { stream: true });
+        logTransportEvent(`${prefix}.stream_chunk`, { chunk });
+
+        // Network chunks can split mid-line; keep the incomplete tail for the next read
+        sseBuffer += chunk;
+        const lines = sseBuffer.split('\n');
+        sseBuffer = lines.pop();
+        const completeLines = lines.filter(line => line.trim() !== '');
+
+        for (const line of completeLines) {
+            if (!line.startsWith('data: ')) continue;
+
+            const data = line.slice(6);
+            if (data === '[DONE]') continue;
+
+            try {
+                const json = JSON.parse(data);
+                logTransportEvent(`${prefix}.stream_event`, json);
+                finishReason = json.choices?.[0]?.finish_reason || finishReason;
+                const token = json.choices?.[0]?.delta?.content || '';
+                if (token) {
+                    fullText += token;
+                    if (emitToRenderer) {
+                        const displayText = stripThinkingTags(fullText);
+                        if (displayText) {
+                            sendToRenderer(isFirst ? 'new-response' : 'update-response', displayText);
+                            isFirst = false;
+                        }
+                    }
+                }
+            } catch (parseError) {
+                logTransportEvent(`${prefix}.stream_parse_error`, {
+                    data,
+                    error: parseError.message,
+                });
+            }
+        }
+    }
+
+    return { ok: true, fullText, finishReason };
+}
+
 async function sendToGroq(transcription) {
     const groqApiKey = getGroqApiKey();
     if (!groqApiKey) {
         console.log('No Groq API key configured, skipping Groq response');
-        return;
+        return { success: false, error: 'No Groq API key configured' };
     }
 
     if (!transcription || transcription.trim() === '') {
         console.log('Empty transcription, skipping Groq');
-        return;
+        return { success: false, error: 'Empty transcription' };
     }
 
     const config = getConfig();
@@ -303,79 +422,22 @@ async function sendToGroq(transcription) {
     }
 
     try {
-        const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-            method: 'POST',
-            headers: {
-                Authorization: `Bearer ${groqApiKey}`,
-                'Content-Type': 'application/json',
-            },
-            body: JSON.stringify({
-                model: modelToUse,
-                messages: [{ role: 'system', content: currentSystemPrompt || 'You are a helpful assistant.' }, ...groqConversationHistory],
-                stream: true,
-                temperature: 0.7,
-                max_completion_tokens: GROQ_MAX_COMPLETION_TOKENS,
-                ...getGroqReasoningOptions(modelToUse, config.disableGroqThinking),
-            }),
+        const result = await streamOpenAiCompletions({
+            endpoint: 'https://api.groq.com/openai/v1/chat/completions',
+            apiKey: groqApiKey,
+            model: modelToUse,
+            messages: [{ role: 'system', content: currentSystemPrompt || 'You are a helpful assistant.' }, ...groqConversationHistory],
+            extraBody: getGroqReasoningOptions(modelToUse, config.disableGroqThinking),
+            label: 'Groq',
+            prefix: 'groq.text',
         });
 
-        if (!response.ok) {
-            const errorText = await response.text();
-            console.error('Groq API error:', response.status, errorText);
-            logTransportEvent('groq.text.http_error', {
-                status: response.status,
-                body: errorText,
-            });
-            sendToRenderer('update-status', `Groq error: ${response.status}`);
-            return;
+        if (!result.ok) {
+            sendToRenderer('update-status', `Groq error: ${result.status}`);
+            return { success: false, error: `Groq error: ${result.status}` };
         }
 
-        logTransportEvent('groq.text.http_response', {
-            status: response.status,
-        });
-
-        const reader = response.body.getReader();
-        const decoder = new TextDecoder();
-        let fullText = '';
-        let isFirst = true;
-        let finishReason = null;
-
-        while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-
-            const chunk = decoder.decode(value, { stream: true });
-            logTransportEvent('groq.text.stream_chunk', { chunk });
-            const lines = chunk.split('\n').filter(line => line.trim() !== '');
-
-            for (const line of lines) {
-                if (line.startsWith('data: ')) {
-                    const data = line.slice(6);
-                    if (data === '[DONE]') continue;
-
-                    try {
-                        const json = JSON.parse(data);
-                        logTransportEvent('groq.text.stream_event', json);
-                        finishReason = json.choices?.[0]?.finish_reason || finishReason;
-                        const token = json.choices?.[0]?.delta?.content || '';
-                        if (token) {
-                            fullText += token;
-                            const displayText = stripThinkingTags(fullText);
-                            if (displayText) {
-                                sendToRenderer(isFirst ? 'new-response' : 'update-response', displayText);
-                                isFirst = false;
-                            }
-                        }
-                    } catch (parseError) {
-                        logTransportEvent('groq.text.stream_parse_error', {
-                            data,
-                            error: parseError.message,
-                        });
-                    }
-                }
-            }
-        }
-
+        const { fullText, finishReason } = result;
         const cleanedResponse = stripThinkingTags(fullText);
         const modelKey = modelToUse.split('/').pop();
 
@@ -402,7 +464,7 @@ async function sendToGroq(transcription) {
             });
             sendToRenderer('new-response', GROQ_EMPTY_RESPONSE_MESSAGE);
             sendToRenderer('update-status', 'Groq reached the completion-token limit');
-            return;
+            return { success: false, error: GROQ_EMPTY_RESPONSE_MESSAGE };
         }
 
         logTransportEvent('groq.text.completed', {
@@ -411,6 +473,7 @@ async function sendToGroq(transcription) {
         });
         console.log(`Groq response completed (${modelToUse})`);
         sendToRenderer('update-status', 'Listening...');
+        return { success: true, text: cleanedResponse, model: modelToUse };
     } catch (error) {
         console.error('Error calling Groq API:', error);
         logTransportEvent('groq.text.error', {
@@ -418,10 +481,11 @@ async function sendToGroq(transcription) {
             stack: error.stack,
         });
         sendToRenderer('update-status', 'Groq error: ' + error.message);
+        return { success: false, error: error.message };
     }
 }
 
-async function sendImageToGroq(base64Data, prompt) {
+async function sendImageToGroq(base64Data, prompt, emitToRenderer = true) {
     const groqApiKey = getGroqApiKey();
     const config = getConfig();
     const model = config.groqImageModel;
@@ -433,98 +497,41 @@ async function sendImageToGroq(base64Data, prompt) {
     });
 
     try {
-        const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-            method: 'POST',
-            headers: {
-                Authorization: `Bearer ${groqApiKey}`,
-                'Content-Type': 'application/json',
-            },
-            body: JSON.stringify({
-                model,
-                messages: [
-                    { role: 'system', content: currentSystemPrompt || 'You are a helpful assistant.' },
-                    {
-                        role: 'user',
-                        content: [
-                            { type: 'text', text: prompt },
-                            {
-                                type: 'image_url',
-                                image_url: {
-                                    url: `data:image/jpeg;base64,${base64Data}`,
-                                },
+        const result = await streamOpenAiCompletions({
+            endpoint: 'https://api.groq.com/openai/v1/chat/completions',
+            apiKey: groqApiKey,
+            model,
+            messages: [
+                { role: 'system', content: currentSystemPrompt || 'You are a helpful assistant.' },
+                {
+                    role: 'user',
+                    content: [
+                        { type: 'text', text: prompt },
+                        {
+                            type: 'image_url',
+                            image_url: {
+                                url: `data:image/jpeg;base64,${base64Data}`,
                             },
-                        ],
-                    },
-                ],
-                stream: true,
-                temperature: 0.7,
-                max_completion_tokens: GROQ_MAX_COMPLETION_TOKENS,
-                ...getGroqReasoningOptions(model, config.disableGroqThinking),
-            }),
+                        },
+                    ],
+                },
+            ],
+            extraBody: getGroqReasoningOptions(model, config.disableGroqThinking),
+            label: 'Groq image',
+            prefix: 'groq.image',
+            emitToRenderer,
         });
 
-        if (!response.ok) {
-            const errorText = await response.text();
-            console.error('Groq image API error:', response.status, errorText);
-            logTransportEvent('groq.image.http_error', {
-                status: response.status,
-                body: errorText,
-            });
-            return { success: false, error: `Groq error: ${response.status}` };
+        if (!result.ok) {
+            return { success: false, error: `Groq error: ${result.status}` };
         }
 
-        logTransportEvent('groq.image.http_response', {
-            status: response.status,
-        });
-
-        const reader = response.body.getReader();
-        const decoder = new TextDecoder();
-        let fullText = '';
-        let isFirst = true;
-        let finishReason = null;
-
-        while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-
-            const chunk = decoder.decode(value, { stream: true });
-            logTransportEvent('groq.image.stream_chunk', { chunk });
-            const lines = chunk.split('\n').filter(line => line.trim() !== '');
-
-            for (const line of lines) {
-                if (!line.startsWith('data: ')) continue;
-
-                const data = line.slice(6);
-                if (data === '[DONE]') continue;
-
-                try {
-                    const json = JSON.parse(data);
-                    logTransportEvent('groq.image.stream_event', json);
-                    finishReason = json.choices?.[0]?.finish_reason || finishReason;
-                    const token = json.choices?.[0]?.delta?.content || '';
-                    if (!token) continue;
-
-                    fullText += token;
-                    const displayText = stripThinkingTags(fullText);
-                    if (displayText) {
-                        sendToRenderer(isFirst ? 'new-response' : 'update-response', displayText);
-                        isFirst = false;
-                    }
-                } catch (parseError) {
-                    logTransportEvent('groq.image.stream_parse_error', {
-                        data,
-                        error: parseError.message,
-                    });
-                }
-            }
-        }
-
-        const cleanedResponse = stripThinkingTags(fullText);
+        const cleanedResponse = stripThinkingTags(result.fullText);
         if (!cleanedResponse) {
             logTransportEvent('groq.image.empty_response', {
                 model,
-                fullText,
-                finishReason,
+                fullText: result.fullText,
+                finishReason: result.finishReason,
             });
             return { success: false, error: GROQ_EMPTY_RESPONSE_MESSAGE };
         }
@@ -543,6 +550,290 @@ async function sendImageToGroq(base64Data, prompt) {
         });
         return { success: false, error: error.message };
     }
+}
+
+async function sendToOpenRouter(transcription) {
+    const apiKey = getOpenRouterApiKey();
+    if (!apiKey) {
+        console.log('No OpenRouter API key configured, skipping OpenRouter response');
+        return { success: false, error: 'No OpenRouter API key configured' };
+    }
+
+    if (!transcription || transcription.trim() === '') {
+        console.log('Empty transcription, skipping OpenRouter');
+        return { success: false, error: 'Empty transcription' };
+    }
+
+    const model = getConfig().openrouterModel;
+
+    console.log(`Sending to OpenRouter (${model}):`, transcription.substring(0, 100) + '...');
+    logTransportEvent('openrouter.text.request', {
+        model,
+        transcription,
+    });
+
+    try {
+        const result = await streamOpenAiCompletions({
+            endpoint: 'https://openrouter.ai/api/v1/chat/completions',
+            apiKey,
+            model,
+            messages: [
+                { role: 'system', content: currentSystemPrompt || 'You are a helpful assistant.' },
+                { role: 'user', content: transcription.trim() },
+            ],
+            label: 'OpenRouter',
+            prefix: 'openrouter.text',
+        });
+
+        if (!result.ok) {
+            sendToRenderer('update-status', `OpenRouter error: ${result.status}`);
+            return { success: false, error: `OpenRouter error: ${result.status}` };
+        }
+
+        const cleanedResponse = stripThinkingTags(result.fullText);
+        if (!cleanedResponse) {
+            console.warn(`OpenRouter returned no final answer (${model})`);
+            sendToRenderer('update-status', 'OpenRouter returned an empty response');
+            return { success: false, error: 'OpenRouter returned an empty response' };
+        }
+
+        saveConversationTurn(transcription, cleanedResponse);
+        logTransportEvent('openrouter.text.completed', {
+            model,
+            response: cleanedResponse,
+        });
+        console.log(`OpenRouter response completed (${model})`);
+        sendToRenderer('update-status', 'Listening...');
+        return { success: true, text: cleanedResponse, model };
+    } catch (error) {
+        console.error('Error calling OpenRouter API:', error);
+        sendToRenderer('update-status', 'OpenRouter error: ' + error.message);
+        return { success: false, error: error.message };
+    }
+}
+
+async function sendImageToOpenRouter(base64Data, prompt, emitToRenderer = true) {
+    const apiKey = getOpenRouterApiKey();
+    const model = getConfig().openrouterImageModel;
+
+    logTransportEvent('openrouter.image.request', {
+        model,
+        prompt,
+        imageBytes: Buffer.byteLength(base64Data, 'base64'),
+    });
+
+    try {
+        const result = await streamOpenAiCompletions({
+            endpoint: 'https://openrouter.ai/api/v1/chat/completions',
+            apiKey,
+            model,
+            messages: [
+                { role: 'system', content: currentSystemPrompt || 'You are a helpful assistant.' },
+                {
+                    role: 'user',
+                    content: [
+                        { type: 'text', text: prompt },
+                        {
+                            type: 'image_url',
+                            image_url: {
+                                url: `data:image/jpeg;base64,${base64Data}`,
+                            },
+                        },
+                    ],
+                },
+            ],
+            label: 'OpenRouter image',
+            prefix: 'openrouter.image',
+            emitToRenderer,
+        });
+
+        if (!result.ok) {
+            return { success: false, error: `OpenRouter error: ${result.status}` };
+        }
+
+        const cleanedResponse = stripThinkingTags(result.fullText);
+        if (!cleanedResponse) {
+            return { success: false, error: 'OpenRouter returned an empty response' };
+        }
+
+        logTransportEvent('openrouter.image.completed', {
+            model,
+            response: cleanedResponse,
+        });
+        return { success: true, text: cleanedResponse, model };
+    } catch (error) {
+        console.error('Error calling OpenRouter image API:', error);
+        logTransportEvent('openrouter.image.error', {
+            error: error.message,
+            stack: error.stack,
+        });
+        return { success: false, error: error.message };
+    }
+}
+
+const EXTRACT_TEXT_PROMPT = 'Extract ALL text from this image verbatim, preserving structure. Output only the extracted text.';
+
+async function extractTextFromImage(base64Data) {
+    let result;
+    if (getApiKey()) {
+        // Own Gemini key (free tier) first — avoids OpenRouter credit/rate-limit issues
+        result = await sendImageToGeminiHttp(base64Data, EXTRACT_TEXT_PROMPT, false);
+    } else if (hasOpenRouterKey()) {
+        result = await sendImageToOpenRouter(base64Data, EXTRACT_TEXT_PROMPT, false);
+    } else if (hasGroqKey()) {
+        result = await sendImageToGroq(base64Data, EXTRACT_TEXT_PROMPT, false);
+    } else {
+        result = await sendImageToGeminiHttp(base64Data, EXTRACT_TEXT_PROMPT);
+    }
+    return result && result.success ? result.text : '';
+}
+
+const DEEPSEEK_ENDPOINT = 'https://api.deepseek.com/chat/completions';
+let deepseekConversationHistory = [];
+
+async function sendToDeepSeek(transcription) {
+    const apiKey = getDeepSeekApiKey();
+    if (!apiKey) {
+        console.log('No DeepSeek API key configured, skipping DeepSeek response');
+        return { success: false, error: 'No DeepSeek API key configured' };
+    }
+
+    if (!transcription || transcription.trim() === '') {
+        console.log('Empty transcription, skipping DeepSeek');
+        return { success: false, error: 'Empty transcription' };
+    }
+
+    const model = getConfig().deepseekModel;
+
+    console.log(`Sending to DeepSeek (${model}):`, transcription.substring(0, 100) + '...');
+    logTransportEvent('deepseek.text.request', {
+        model,
+        transcription,
+    });
+
+    deepseekConversationHistory.push({
+        role: 'user',
+        content: transcription.trim(),
+    });
+
+    if (deepseekConversationHistory.length > 20) {
+        deepseekConversationHistory = deepseekConversationHistory.slice(-20);
+    }
+
+    try {
+        const result = await streamOpenAiCompletions({
+            endpoint: DEEPSEEK_ENDPOINT,
+            apiKey,
+            model,
+            messages: [{ role: 'system', content: currentSystemPrompt || 'You are a helpful assistant.' }, ...deepseekConversationHistory],
+            label: 'DeepSeek',
+            prefix: 'deepseek.text',
+        });
+
+        if (!result.ok) {
+            deepseekConversationHistory.pop();
+            sendToRenderer('update-status', `DeepSeek error: ${result.status}`);
+            return { success: false, error: `DeepSeek error: ${result.status}` };
+        }
+
+        const cleanedResponse = stripThinkingTags(result.fullText);
+        if (!cleanedResponse) {
+            deepseekConversationHistory.pop();
+            console.warn(`DeepSeek returned no final answer (${model})`);
+            sendToRenderer('update-status', 'DeepSeek returned an empty response');
+            return { success: false, error: 'DeepSeek returned an empty response' };
+        }
+
+        deepseekConversationHistory.push({
+            role: 'assistant',
+            content: cleanedResponse,
+        });
+
+        saveConversationTurn(transcription, cleanedResponse);
+        logTransportEvent('deepseek.text.completed', {
+            model,
+            response: cleanedResponse,
+        });
+        console.log(`DeepSeek response completed (${model})`);
+        sendToRenderer('update-status', 'Listening...');
+        return { success: true, text: cleanedResponse, model };
+    } catch (error) {
+        deepseekConversationHistory.pop();
+        console.error('Error calling DeepSeek API:', error);
+        sendToRenderer('update-status', 'DeepSeek error: ' + error.message);
+        return { success: false, error: error.message };
+    }
+}
+
+async function sendImageToDeepSeek(base64Data, prompt, emitToRenderer = true) {
+    const apiKey = getDeepSeekApiKey();
+    const model = getConfig().deepseekVisionModel;
+    if (!apiKey) return { success: false, error: 'No DeepSeek API key configured' };
+
+    logTransportEvent('deepseek.image.request', {
+        model,
+        imageBytes: Buffer.byteLength(base64Data, 'base64'),
+    });
+
+    try {
+        const result = await streamOpenAiCompletions({
+            endpoint: DEEPSEEK_ENDPOINT,
+            apiKey,
+            model,
+            messages: [
+                { role: 'system', content: currentSystemPrompt || 'You are a helpful assistant.' },
+                {
+                    role: 'user',
+                    content: [
+                        { type: 'text', text: prompt },
+                        {
+                            type: 'image_url',
+                            image_url: { url: `data:image/jpeg;base64,${base64Data}` },
+                        },
+                    ],
+                },
+            ],
+            label: 'DeepSeek image',
+            prefix: 'deepseek.image',
+            emitToRenderer,
+        });
+
+        if (!result.ok) {
+            return { success: false, error: `DeepSeek error: ${result.status}` };
+        }
+
+        const cleanedResponse = stripThinkingTags(result.fullText);
+        if (!cleanedResponse) {
+            return { success: false, error: 'DeepSeek returned an empty response' };
+        }
+
+        logTransportEvent('deepseek.image.completed', { model, response: cleanedResponse });
+        return { success: true, text: cleanedResponse, model };
+    } catch (error) {
+        console.error('Error calling DeepSeek image API:', error);
+        return { success: false, error: error.message };
+    }
+}
+
+// Try text providers in priority order, falling back on failure
+async function sendTextWithFallback(text) {
+    if (hasDeepSeekKey()) {
+        const result = await sendToDeepSeek(text);
+        if (result.success) return result;
+    }
+    if (hasGroqKey()) {
+        const result = await sendToGroq(text);
+        if (result.success) return result;
+    }
+    if (hasOpenRouterKey()) {
+        const result = await sendToOpenRouter(text);
+        if (result.success) return result;
+    }
+    return { success: false, error: 'All text providers failed' };
+}
+
+async function processScreenText(combinedPrompt) {
+    return sendTextWithFallback(combinedPrompt);
 }
 
 async function sendToGemma(transcription) {
@@ -630,6 +921,12 @@ async function initializeGeminiSession(apiKey, customPrompt = '', profile = 'int
     if (isInitializingSession) {
         console.log('Session initialization already in progress');
         return false;
+    }
+
+    // Live audio disabled — skip opening the live session entirely (no connect, no reconnect)
+    if (getPreferences().liveAudioEnabled === false) {
+        console.log('Live audio disabled — skipping live session');
+        return null;
     }
 
     isInitializingSession = true;
@@ -993,7 +1290,7 @@ async function sendAudioToGemini(base64Data, geminiSessionRef) {
     }
 }
 
-async function sendImageToGeminiHttp(base64Data, prompt) {
+async function sendImageToGeminiHttp(base64Data, prompt, emitToRenderer = true) {
     // Get available model based on rate limits
     const model = getAvailableModel();
 
@@ -1031,9 +1328,11 @@ async function sendImageToGeminiHttp(base64Data, prompt) {
             const chunkText = chunk.text;
             if (chunkText) {
                 fullText += chunkText;
-                // Send to renderer - new response for first chunk, update for subsequent
-                sendToRenderer(isFirst ? 'new-response' : 'update-response', fullText);
-                isFirst = false;
+                if (emitToRenderer) {
+                    // Send to renderer - new response for first chunk, update for subsequent
+                    sendToRenderer(isFirst ? 'new-response' : 'update-response', fullText);
+                    isFirst = false;
+                }
             }
         }
 
@@ -1169,6 +1468,7 @@ function setupGeminiIpcHandlers(geminiSessionRef) {
     });
 
     ipcMain.handle('send-image-content', async (event, { data, prompt }) => {
+        ensureContextPrompt();
         try {
             if (!data || typeof data !== 'string') {
                 console.error('Invalid image data received');
@@ -1197,6 +1497,23 @@ function setupGeminiIpcHandlers(geminiSessionRef) {
                 return result;
             }
 
+            // One-shot vision: DeepSeek answers the screenshot directly (no separate OCR step)
+            if (getPreferences().liveAudioEnabled !== true && hasDeepSeekKey() && prompt && prompt.trim()) {
+                return await sendImageToDeepSeek(data, prompt);
+            }
+
+            // Live audio off: extract screen text, then answer through the text provider (OpenRouter → Groq)
+            if (getPreferences().liveAudioEnabled !== true && (hasOpenRouterKey() || hasGroqKey())) {
+                const extractedText = await extractTextFromImage(data);
+                sendToRenderer('extracted-text', extractedText);
+                if (!extractedText || !extractedText.trim()) {
+                    return { success: false, error: 'Screen text extraction failed — no text returned. Check the extraction model and retry.' };
+                }
+                const combinedPrompt = `${prompt || 'Analyze the screen'}\n\nScreen text:\n${extractedText}`;
+                const result = await processScreenText(combinedPrompt);
+                return { success: true, model: result.model || '', extractedText };
+            }
+
             const result = hasGroqKey() ? await sendImageToGroq(data, prompt) : await sendImageToGeminiHttp(data, prompt);
             return result;
         } catch (error) {
@@ -1209,6 +1526,8 @@ function setupGeminiIpcHandlers(geminiSessionRef) {
         if (!text || typeof text !== 'string' || text.trim().length === 0) {
             return { success: false, error: 'Invalid text message' };
         }
+
+        ensureContextPrompt();
 
         if (currentProviderMode === 'cloud') {
             try {
@@ -1229,6 +1548,12 @@ function setupGeminiIpcHandlers(geminiSessionRef) {
                 console.error('Error sending local text:', error);
                 return { success: false, error: error.message };
             }
+        }
+
+        // Without live audio, answer through the configured HTTP text provider (DeepSeek → Groq → OpenRouter)
+        if (getPreferences().liveAudioEnabled !== true && (hasDeepSeekKey() || hasGroqKey() || hasOpenRouterKey())) {
+            const result = await sendTextWithFallback(text.trim());
+            return result && result.success ? { success: true } : { success: false, error: (result && result.error) || 'Text provider failed' };
         }
 
         if (!geminiSessionRef.current) return { success: false, error: 'No active Gemini session' };

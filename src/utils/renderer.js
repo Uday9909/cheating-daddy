@@ -56,6 +56,20 @@ const storage = {
     async setGroqApiKey(groqApiKey) {
         return ipcRenderer.invoke('storage:set-groq-api-key', groqApiKey);
     },
+    async getOpenRouterApiKey() {
+        const result = await ipcRenderer.invoke('storage:get-openrouter-api-key');
+        return result.success ? result.data : '';
+    },
+    async setOpenRouterApiKey(openrouterApiKey) {
+        return ipcRenderer.invoke('storage:set-openrouter-api-key', openrouterApiKey);
+    },
+    async getDeepSeekApiKey() {
+        const result = await ipcRenderer.invoke('storage:get-deepseek-api-key');
+        return result.success ? result.data : '';
+    },
+    async setDeepSeekApiKey(deepseekApiKey) {
+        return ipcRenderer.invoke('storage:set-deepseek-api-key', deepseekApiKey);
+    },
 
     // Preferences
     async getPreferences() {
@@ -198,6 +212,11 @@ ipcRenderer.on('update-status', (event, status) => {
     cheatingDaddy.setStatus(status);
 });
 
+// Show extracted screen text before the streamed answer
+ipcRenderer.on('extracted-text', (event, text) => {
+    if (text) cheatingDaddy.addNewResponse('**Screen text:**\n' + text);
+});
+
 async function startCapture(screenshotIntervalSeconds = 5, imageQuality = 'medium') {
     // Store the image quality for manual screenshots
     currentImageQuality = imageQuality;
@@ -205,9 +224,10 @@ async function startCapture(screenshotIntervalSeconds = 5, imageQuality = 'mediu
     // Refresh preferences cache
     await loadPreferencesCache();
     const audioMode = preferencesCache.audioMode || 'speaker_only';
+    const liveAudioEnabled = preferencesCache.liveAudioEnabled === true;
 
     try {
-        if (isMacOS) {
+        if (liveAudioEnabled && isMacOS) {
             // On macOS, use SystemAudioDump for audio and getDisplayMedia for screen
             console.log('Starting macOS capture with SystemAudioDump...');
 
@@ -248,7 +268,7 @@ async function startCapture(screenshotIntervalSeconds = 5, imageQuality = 'mediu
                     console.warn('Failed to get microphone access on macOS:', micError);
                 }
             }
-        } else if (isLinux) {
+        } else if (liveAudioEnabled && isLinux) {
             // Linux - use display media for screen capture and try to get system audio
             try {
                 // First try to get system audio via getDisplayMedia (works on newer browsers)
@@ -311,7 +331,7 @@ async function startCapture(screenshotIntervalSeconds = 5, imageQuality = 'mediu
             }
 
             console.log('Linux capture started - system audio:', mediaStream.getAudioTracks().length > 0, 'microphone mode:', audioMode);
-        } else {
+        } else if (liveAudioEnabled) {
             // Windows - use display media with loopback for system audio
             mediaStream = await navigator.mediaDevices.getDisplayMedia({
                 video: {
@@ -352,6 +372,17 @@ async function startCapture(screenshotIntervalSeconds = 5, imageQuality = 'mediu
                     console.warn('Failed to get microphone access on Windows:', micError);
                 }
             }
+        } else {
+            // Live audio disabled - screen-only capture (no system/mic audio)
+            mediaStream = await navigator.mediaDevices.getDisplayMedia({
+                video: {
+                    frameRate: 1,
+                    width: { ideal: 1920 },
+                    height: { ideal: 1080 },
+                },
+                audio: false,
+            });
+            console.log('Live audio disabled - screen-only capture started');
         }
 
         console.log('MediaStream obtained:', {
@@ -648,7 +679,7 @@ async function captureManualScreenshot(imageQuality = null) {
 
                 if (result.success) {
                     console.log(`Image response completed from ${result.model}`);
-                    // Response already displayed via streaming events (new-response/update-response)
+                    // Screen text already shown via extracted-text event; answer via new-response/update-response
                 } else {
                     console.error('Failed to get image response:', result.error);
                     cheatingDaddy.addNewResponse(`Error: ${result.error}`);
@@ -787,6 +818,21 @@ function handleShortcut(shortcutKey) {
 
 // Create reference to the main app element
 const cheatingDaddyApp = document.querySelector('cheating-daddy-app');
+
+// Auto-write trigger from the global shortcut
+ipcRenderer.on('trigger-autowrite', () => {
+    const hasAnswer = cheatingDaddyApp.responses && cheatingDaddyApp.responses.length > 0 && cheatingDaddyApp.currentResponseIndex >= 0;
+
+    if (cheatingDaddyApp.currentView !== 'assistant' || !hasAnswer) {
+        cheatingDaddy.setStatus('No answer available to auto-write');
+        return;
+    }
+
+    const assistantView = cheatingDaddyApp.shadowRoot?.querySelector('assistant-view');
+    if (assistantView && typeof assistantView.handleAutoWriteToggle === 'function') {
+        assistantView.handleAutoWriteToggle();
+    }
+});
 
 // ============ THEME SYSTEM ============
 const theme = {
@@ -1102,6 +1148,30 @@ const cheatingDaddy = {
 
     // Refresh preferences cache (call after updating preferences)
     refreshPreferencesCache: loadPreferencesCache,
+
+    // Auto-Write API
+    autoWrite: {
+        extract: async (text, options) => {
+            const res = await ipcRenderer.invoke('autowrite:extract', text, options);
+            return res.success ? res.data : { type: 'empty', text: '', hasCode: false, language: '' };
+        },
+        start: async (text, options) => {
+            return ipcRenderer.invoke('autowrite:start', text, options);
+        },
+        stop: async () => {
+            return ipcRenderer.invoke('autowrite:stop');
+        },
+        pause: async () => {
+            return ipcRenderer.invoke('autowrite:pause');
+        },
+        resume: async () => {
+            return ipcRenderer.invoke('autowrite:resume');
+        },
+        status: async () => {
+            const res = await ipcRenderer.invoke('autowrite:status');
+            return res.success ? { isWriting: res.isWriting, isPaused: res.isPaused } : { isWriting: false, isPaused: false };
+        },
+    },
 
     // Platform detection
     isLinux: isLinux,

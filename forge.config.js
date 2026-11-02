@@ -3,7 +3,7 @@ const { FuseV1Options, FuseVersion } = require('@electron/fuses');
 
 module.exports = {
     packagerConfig: {
-        asar: true,
+        asar: { unpack: '**/scripts/*.ps1' },
         extraResource: ['./src/assets/SystemAudioDump'],
         name: 'Cheating Daddy',
         icon: 'src/assets/logo',
