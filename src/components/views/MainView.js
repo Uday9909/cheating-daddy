@@ -1077,7 +1077,11 @@ export class MainView extends LitElement {
         if (this.isInitializing || this.downloadProgress.active) return;
 
         if (this._mode === 'byok') {
-            if (!this._geminiKey.trim()) {
+            const hasGeminiKey = this._geminiKey.trim() !== '';
+            const hasTextProviderKey = [this._deepseekKey, this._groqKey, this._openrouterKey].some(key => key.trim() !== '');
+            const hasRequiredKey = this._liveAudioEnabled ? hasGeminiKey : hasGeminiKey || hasTextProviderKey;
+
+            if (!hasRequiredKey) {
                 this._keyError = true;
                 this.requestUpdate();
                 return;

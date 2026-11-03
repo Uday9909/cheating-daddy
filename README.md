@@ -31,10 +31,11 @@ Requires **Node.js 18+** (20+ recommended) and npm.
 ## Usage
 
 1. Paste your DeepSeek API key in the main window (Config → DeepSeek)
-2. Choose your profile and language in settings
-3. Click "Start Session" to begin
-4. Position the window using the keyboard shortcuts
-5. The AI responds in real time as the interviewer speaks
+2. Leave **Live audio (Gemini)** disabled when using DeepSeek for screen-text responses. A Gemini key is only required when Live Audio is enabled.
+3. Choose your profile and language in settings
+4. Click "Start Session" to begin
+5. Position the window using the keyboard shortcuts
+6. The AI responds in real time as the interviewer speaks
 
 ## Auto-Write
 

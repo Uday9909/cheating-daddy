@@ -627,8 +627,16 @@ export class CheatingDaddyApp extends LitElement {
                 return;
             }
         } else {
-            const apiKey = await cheatingDaddy.storage.getApiKey();
-            if (!apiKey || apiKey === '') {
+            const [geminiKey, deepseekKey, groqKey, openrouterKey] = await Promise.all([
+                cheatingDaddy.storage.getApiKey(),
+                cheatingDaddy.storage.getDeepSeekApiKey(),
+                cheatingDaddy.storage.getGroqApiKey(),
+                cheatingDaddy.storage.getOpenRouterApiKey(),
+            ]);
+            const hasGeminiKey = geminiKey && geminiKey.trim() !== '';
+            const hasTextProviderKey = [deepseekKey, groqKey, openrouterKey].some(key => key && key.trim() !== '');
+
+            if ((prefs.liveAudioEnabled !== false && !hasGeminiKey) || (prefs.liveAudioEnabled === false && !hasGeminiKey && !hasTextProviderKey)) {
                 const mainView = this.shadowRoot.querySelector('main-view');
                 if (mainView && mainView.triggerApiKeyError) {
                     mainView.triggerApiKeyError();
